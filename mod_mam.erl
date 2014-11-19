@@ -39,7 +39,7 @@
          start/2,
          stop/1,
          send_packet/3,
-         receive_packet/4,
+%         receive_packet/4,
          get_disco_features/5,
          process_iq/3,
          process_local_iq/3
@@ -130,12 +130,12 @@ stop(Host) ->
 send_packet(From, To, Packet) ->
     Host = From#jid.lserver,
     Proc = get_proc(Host),
-    gen_server:cast(Proc, {log, to, From#jid.luser, Host, To, Packet}).
+    gen_server:cast(Proc, {log, From, To, Packet}).
 
-receive_packet(_Jid, From, To, Packet) ->
-    Host = To#jid.lserver,
-    Proc = get_proc(Host),
-    gen_server:cast(Proc, {log, from, To#jid.luser, Host, From, Packet}).
+% receive_packet(_Jid, From, To, Packet) ->
+%     Host = To#jid.lserver,
+%     Proc = get_proc(Host),
+%     gen_server:cast(Proc, {log, from, To#jid.luser, Host, From, Packet}).
 
 
 %%%-------------------------------------------------------------------
@@ -207,7 +207,7 @@ init([Host, Opts]) ->
 
     % hook into send/receive packet
     ejabberd_hooks:add(user_send_packet, Host, ?MODULE, send_packet, 80),
-    ejabberd_hooks:add(user_receive_packet, Host, ?MODULE, receive_packet, 80),
+%    ejabberd_hooks:add(user_receive_packet, Host, ?MODULE, receive_packet, 80),
     ejabberd_hooks:add(disco_local_features, Host, ?MODULE, get_disco_features, 99),
     ejabberd_hooks:add(disco_sm_features, Host, ?MODULE, get_disco_features, 99),
 
@@ -290,21 +290,19 @@ handle_cast({process_query, From, To, #iq{sub_el = Query} = IQ}, State) ->
 
 %% handle a 'log' request meaning a message that should be stored
 %% in the message archive
-handle_cast({log, Dir, LUser, LServer, Jid, Packet}, State) ->
+handle_cast({log, From, To, Packet}, State) ->
     ?DEBUG("Packet: ~p", [Packet]),
 
     % TODO: we should add an '<archived/>' tag to the original message
     % TODO: this probably means we have to use the filter_packet hook instead
 
-    case should_store(LUser, LServer) of
+    case should_store(From, To) of
         true ->
-            IgnoreChats = State#state.ignore_chats,
-            case extract_body(Packet, IgnoreChats) of
-                ignore -> ok;
-                Body ->
-                    Db = State#state.db,
-                    Element = {Dir, LUser, LServer, Jid, Body, Packet},
-                    insert(Db, Element, gen_mod:db_type(LServer, ?MODULE))
+            case xml:get_subtag(Packet, <<"body">>) of
+                false -> ok;
+                XmlBody ->
+                    Body = xml:get_tag_cdata(XmlBody),
+                    insert(From, To, Body, gen_mod:db_type(From#jid.lserver, ?MODULE))
             end;
         false -> ok
     end,
@@ -343,7 +341,7 @@ terminate(_Reason, State) ->
     ?INFO_MSG("Stopping mod_mam module of '~s'", [Host]),
 
     ejabberd_hooks:delete(user_send_packet, Host, ?MODULE, send_packet, 80),
-    ejabberd_hooks:delete(user_receive_packet, Host, ?MODULE, receive_packet, 80),
+%    ejabberd_hooks:delete(user_receive_packet, Host, ?MODULE, receive_packet, 80),
     ejabberd_hooks:delete(disco_local_features, Host, ?MODULE, get_disco_features, 99),
     ejabberd_hooks:delete(disco_sm_features, Host, ?MODULE, get_disco_features, 99),
 
@@ -405,27 +403,9 @@ ensure_db_started(mongodb) ->
 ensure_db_started(odbc) ->
     ok.
 
-should_store(_User, _Server) ->
+should_store(_From, _To) ->
     % TODO
     true.
-
-extract_body(#xmlel{name = <<"message">>} = Xml, IgnoreChats) ->
-    % archive messages with a body tag only
-    case xml:get_subtag(Xml, <<"body">>) of
-        false -> ignore;
-        Body ->
-            case IgnoreChats of
-                true ->
-                    % do not archive groupchat messages
-                    case xml:get_tag_attr(<<"type">>, Xml) of
-                        {value, <<"groupchat">>} -> ignore;
-                        _ -> xml:get_tag_cdata(Body)
-                    end;
-                _ -> xml:get_tag_cdata(Body)
-            end
-    end;
-
-extract_body(_, _) -> ignore.
 
 %% try to extract an integer out of an XML tag content
 int_cdata(Tag) ->
@@ -806,12 +786,11 @@ take_inner(Cursor, Count, Acc) when Count > 0 ->
 take_inner(_Cursor, _Count, Acc) -> Acc.
 
 %% insert a new message document
-insert({_Pool, _Db, Coll} = M, {Dir, LUser, LServer, Jid, Body, Packet} = Element, mongodb) ->
-    Doc = msg_to_bson(Dir, LUser, LServer, Jid, Body, Packet),
-    Fun = fun () -> mongo:insert(Coll, Doc) end,
-    exec(M, Fun, unsafe);
-insert(M, Element, odbc) ->
-    ?INFO_MSG("Insert into odbc", []).
+insert(From, To, Body, odbc) ->
+    Ret = odbc_queries:update(<<"localhost">>, <<"messages">>, 
+                     [<<"sender_id">>, <<"receiver_id">>, <<"message">>], 
+                     [From#jid.user, To#jid.user, Body], []),
+    ?INFO_MSG("insert Success: ~p", [Ret]).
 
 %% execute a mongo command using the specified connection pool
 exec(Mongo, Function) ->
