@@ -78,7 +78,7 @@
 
 -record(state, {host = <<"">>        :: binary(),
                 ignore_chats = false :: boolean(),
-                mongo}).
+                db}).
 
 -record(rsm, {max = none,
               after_item = none,
@@ -109,9 +109,7 @@ start_link(Host, Opts) ->
 start(Host, Opts) ->
     Proc = get_proc(Host),
 
-    % make sure bson and mongodb are running
-    ok = application:ensure_started(bson),
-    ok = application:ensure_started(mongodb),
+    ensure_db_started(gen_mod:db_type(Opts)),
 
     Child =
         {Proc,
@@ -189,9 +187,9 @@ get_disco_features(Acc, _From, _To, _Node, _Lang) ->
 %%% gen_server callbacks
 %%%===================================================================
 
-%%--------------------------------------------------------------------
 %% @private
 %% @doc
+%%--------------------------------------------------------------------
 %% Initializes the server
 %%
 %% @spec init(Args) -> {ok, State} |
@@ -207,17 +205,6 @@ init([Host, Opts]) ->
     IQDisc = gen_mod:get_opt(iqdisc, Opts, false, one_queue),
     IgnoreChats = gen_mod:get_opt(ignore_chats, Opts, false, false),
 
-    % get MongoDB options
-    MongoConn = gen_mod:get_opt(mongo, Opts,
-                                fun ({H, P}) -> {H, P};
-                                    ([{H, P}]) -> {H, P}
-                                end,
-                                {localhost, 27017}),
-    MongoDb = gen_mod:get_opt(mongo_database, Opts,
-                              fun (X) when is_atom(X) -> X end, test),
-    MongoColl = gen_mod:get_opt(mongo_collection, Opts,
-                                fun (X) when is_atom(X) -> X end, ejabberd_mam),
-
     % hook into send/receive packet
     ejabberd_hooks:add(user_send_packet, Host, ?MODULE, send_packet, 80),
     ejabberd_hooks:add(user_receive_packet, Host, ?MODULE, receive_packet, 80),
@@ -230,16 +217,11 @@ init([Host, Opts]) ->
     gen_iq_handler:add_iq_handler(ejabberd_local, Host, ?NS_MAM, ?MODULE,
                                   process_local_iq, IQDisc),
 
-    % create connection pool
-    MPool = get_connection_pool(MongoConn),
-    Mongo = {MPool, MongoDb, MongoColl},
-
-    ?INFO_MSG("Using MongoDB at ~p - database '~s' - collection '~s'",
-             [MongoConn, MongoDb, MongoColl]),
+    Db = create_db_connection(Opts),
 
     {ok, #state{host = Host,
                 ignore_chats = IgnoreChats,
-                mongo = Mongo}}.
+                db = Db}}.
 
 %%--------------------------------------------------------------------
 %% @private
@@ -282,12 +264,11 @@ handle_cast({process_query, From, To, #iq{sub_el = Query} = IQ}, State) ->
     case Filter of
         #filter{start = S, 'end' = E, jid = J, rsm = RSM} ->
             ?DEBUG("Filter: ~p", [Filter]),
-            User = From#jid.luser,
-            Mongo = State#state.mongo,
+            Db = State#state.db,
             QueryId = xml:get_tag_attr_s(<<"queryid">>, Query),
             Fs = [{start, S}, {'end', E}, {jid, J}],
 
-            case find(Mongo, User, Fs, RSM) of
+            case find(Db, From, Fs, RSM) of
                 {error, Error} ->
                     ejabberd_router:route(To, From, Error);
                 Ms when is_list(Ms) ->
@@ -321,9 +302,9 @@ handle_cast({log, Dir, LUser, LServer, Jid, Packet}, State) ->
             case extract_body(Packet, IgnoreChats) of
                 ignore -> ok;
                 Body ->
-                    Mongo = State#state.mongo,
-                    Doc = msg_to_bson(Dir, LUser, LServer, Jid, Body, Packet),
-                    insert(Mongo, Doc)
+                    Db = State#state.db,
+                    Element = {Dir, LUser, LServer, Jid, Body, Packet},
+                    insert(Db, Element, gen_mod:db_type(LServer, ?MODULE))
             end;
         false -> ok
     end,
@@ -359,8 +340,6 @@ handle_info(_Info, State) ->
 %%--------------------------------------------------------------------
 terminate(_Reason, State) ->
     Host = State#state.host,
-    {Pool, _Db, _Coll} = State#state.mongo,
-
     ?INFO_MSG("Stopping mod_mam module of '~s'", [Host]),
 
     ejabberd_hooks:delete(user_send_packet, Host, ?MODULE, send_packet, 80),
@@ -371,7 +350,8 @@ terminate(_Reason, State) ->
     gen_iq_handler:remove_iq_handler(ejabberd_local, Host, ?NS_MAM),
     gen_iq_handler:remove_iq_handler(ejabberd_sm, Host, ?NS_MAM),
 
-    resource_pool:close(Pool),
+    Db = State#state.db,
+    terminate_db_connection(Db, gen_mod:db_type(Host)),
     ok.
 
 %%--------------------------------------------------------------------
@@ -388,6 +368,42 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+terminate_db_connection(Db, mongodb) ->
+    {Pool, _Db, _Coll} = Db,
+    resource_pool:close(Pool).
+
+create_db_connection(Opts) ->
+    create_db_connection(Opts, gen_mod:db_type(Opts)).
+
+create_db_connection(Opts, mongodb) ->
+    % get MongoDB options
+    MongoConn = gen_mod:get_opt(mongo, Opts,
+                                fun ({H, P}) -> {H, P};
+                ([{H, P}]) -> {H, P}
+            end,
+                                {localhost, 27017}),
+    MongoDb = gen_mod:get_opt(mongo_database, Opts,
+                              fun (X) when is_atom(X) -> X end, test),
+    MongoColl = gen_mod:get_opt(mongo_collection, Opts,
+                                fun (X) when is_atom(X) -> X end, ejabberd_mam),
+
+    % create connection pool
+    MPool = get_connection_pool(MongoConn),
+    Mongo = {MPool, MongoDb, MongoColl},
+
+    ?INFO_MSG("Using MongoDB at ~p - database '~s' - collection '~s'",
+             [MongoConn, MongoDb, MongoColl]),
+    Mongo;
+create_db_connection(Opts, odbc) ->
+    ?INFO_MSG("Using ODBC", []).
+
+ensure_db_started(mongodb) ->
+    % make sure bson and mongodb are running
+    ok = application:ensure_started(bson),
+    ok = application:ensure_started(mongodb);
+ensure_db_started(odbc) ->
+    ok.
 
 should_store(_User, _Server) ->
     % TODO
@@ -624,6 +640,7 @@ get_connection_pool({Rs, Nodes} = Conn) when is_list(Nodes) ->
     resource_pool:new(mongo:rs_connect_factory(Conn), ?POOL_SIZE).
 
 
+
 %% build a BSON document based on the given JID
 get_jid_document(Jid) ->
     {U, S, R} = jlib:jid_tolower(Jid),
@@ -735,7 +752,13 @@ query_order(asc)  -> {'_id', 1}.
 
 %% query the mongo database for specific messages using a query
 %% based on optional filters/RSM instructions
-find({_Pool, _Db, Coll} = M, User, Filter, RSM) ->
+
+find(M, From, Filter, RSM) ->
+    User = From#jid.luser,
+    Server = From#jid.lserver,
+    find(M, User, Filter, RSM, gen_mod:db_type(Server, ?MODULE)).
+
+find({_Pool, _Db, Coll} = M, User, Filter, RSM, mongodb) ->
     Base = [{u, User}],
     BaseQuery = bson:document(lists:foldl(fun add_to_query/2, Base, Filter)),
     Order = get_order(RSM),
@@ -763,7 +786,9 @@ find({_Pool, _Db, Coll} = M, User, Filter, RSM) ->
                        true -> Rs
                     end
             end
-    end.
+    end;
+find(M, From, Filter, RSM, odbc) ->
+    ?INFO_MSG("Query in odbc", []).
 
 take(Cursor, Count, Order) ->
     Result = take_inner(Cursor, Count, []),
@@ -781,9 +806,12 @@ take_inner(Cursor, Count, Acc) when Count > 0 ->
 take_inner(_Cursor, _Count, Acc) -> Acc.
 
 %% insert a new message document
-insert({_Pool, _Db, Coll} = M, Element) ->
-    Fun = fun () -> mongo:insert(Coll, Element) end,
-    exec(M, Fun, unsafe).
+insert({_Pool, _Db, Coll} = M, {Dir, LUser, LServer, Jid, Body, Packet} = Element, mongodb) ->
+    Doc = msg_to_bson(Dir, LUser, LServer, Jid, Body, Packet),
+    Fun = fun () -> mongo:insert(Coll, Doc) end,
+    exec(M, Fun, unsafe);
+insert(M, Element, odbc) ->
+    ?INFO_MSG("Insert into odbc", []).
 
 %% execute a mongo command using the specified connection pool
 exec(Mongo, Function) ->
